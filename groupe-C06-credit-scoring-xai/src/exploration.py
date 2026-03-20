@@ -1,115 +1,327 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+from pathlib import Path
+import json
+import joblib
 import warnings
-import os
+import argparse
 
-warnings.filterwarnings('ignore')
-sns.set_theme(style='whitegrid', palette='muted')
-plt.rcParams['figure.dpi'] = 110
-plt.rcParams['axes.spines.top'] = False
-plt.rcParams['axes.spines.right'] = False
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-os.makedirs('data/raw', exist_ok=True)
-os.makedirs('data/processed', exist_ok=True)
-os.makedirs('models', exist_ok=True)
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler
+
+warnings.filterwarnings("ignore")
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams["figure.dpi"] = 110
+plt.rcParams["axes.spines.top"] = False
+plt.rcParams["axes.spines.right"] = False
 
 RANDOM_STATE = 42
-print('Setup OK')
 
-COLUMN_NAMES = [
-    'statut_compte', 'duree_mois', 'historique_credit', 'objet_credit',
-    'montant_credit', 'epargne', 'anciennete_emploi', 'taux_versement',
-    'statut_civil_sexe', 'autres_debiteurs', 'anciennete_residence',
-    'propriete', 'age', 'autres_credits', 'logement', 'nb_credits',
-    'emploi', 'nb_personnes_charge', 'telephone', 'travailleur_etranger',
-    'defaut'
-]
+BASE_DIR = Path(__file__).resolve().parent.parent
+RAW_DIR = BASE_DIR / "data" / "raw"
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
+MODELS_DIR = BASE_DIR / "models"
+RESULTS_DIR = BASE_DIR / "results"
 
-df = pd.read_csv(
-    'data/raw/german.data',
-    sep=' ',
-    header=None,
-    names=COLUMN_NAMES
-)
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-df['defaut'] = (df['defaut'] == 2).astype(int)
 
-print(f'Dataset chargé : {df.shape[0]} lignes × {df.shape[1]} colonnes')
-print(f'Taux de défaut : {df["defaut"].mean():.1%}')
-print(df.head())
+def build_preprocessor(X: pd.DataFrame):
+    num_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    cat_features = X.select_dtypes(include=["object", "category"]).columns.tolist()
 
-info = pd.DataFrame({
-    'dtype': df.dtypes,
-    'valeurs_manquantes': df.isnull().sum(),
-    'pct_manquant': (df.isnull().sum() / len(df) * 100).round(2),
-    'nb_uniques': df.nunique()
-})
-print(info.to_string())
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
 
-fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-counts = df['defaut'].value_counts()
-colors = ['#5DCAA5', '#E24B4A']
-axes[0].bar(['Bon payeur (0)', 'Défaut (1)'], counts.values, color=colors, width=0.5)
-axes[0].set_title('Distribution de la cible', fontweight='bold')
-axes[0].set_ylabel('Nombre de clients')
-for i, v in enumerate(counts.values):
-    axes[0].text(i, v + 5, f'{v} ({v/len(df):.0%})', ha='center', fontsize=11)
-axes[1].pie(counts.values, labels=['Bon payeur', 'Défaut'],
-            colors=colors, autopct='%1.1f%%', startangle=90,
-            textprops={'fontsize': 11})
-axes[1].set_title('Proportions', fontweight='bold')
-plt.tight_layout()
-plt.savefig('data/processed/fig_target_distribution.png', bbox_inches='tight')
-plt.show()
-print(f'Ratio déséquilibre : {counts[0]/counts[1]:.1f}:1')
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+    ])
 
-NUM_COLS = ['duree_mois', 'montant_credit', 'taux_versement',
-            'anciennete_residence', 'age', 'nb_credits', 'nb_personnes_charge']
+    preprocessor = ColumnTransformer([
+        ("num", numeric_pipeline, num_features),
+        ("cat", categorical_pipeline, cat_features)
+    ])
 
-fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-axes = axes.flatten()
-for i, col in enumerate(NUM_COLS):
-    for val, color, label in [(0, '#5DCAA5', 'Bon payeur'), (1, '#E24B4A', 'Défaut')]:
-        axes[i].hist(df[df['defaut']==val][col], bins=20, alpha=0.6,
-                     color=color, label=label, density=True)
-    axes[i].set_title(col, fontsize=10, fontweight='bold')
-    axes[i].legend(fontsize=8)
-axes[-1].set_visible(False)
-plt.suptitle('Distribution des variables numériques par classe', fontweight='bold')
-plt.tight_layout()
-plt.savefig('data/processed/fig_numeric_distributions.png', bbox_inches='tight')
-plt.show()
+    return preprocessor, num_features, cat_features
 
-top_cats = ['statut_compte', 'historique_credit', 'epargne',
-            'anciennete_emploi', 'objet_credit', 'emploi']
-fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-axes = axes.flatten()
-for i, col in enumerate(top_cats):
-    taux = df.groupby(col)['defaut'].mean().sort_values(ascending=False)
-    axes[i].bar(range(len(taux)), taux.values,
-                color=plt.cm.RdYlGn_r(taux.values))
-    axes[i].set_xticks(range(len(taux)))
-    axes[i].set_xticklabels(taux.index, rotation=30, ha='right', fontsize=9)
-    axes[i].set_title(f'Taux défaut — {col}', fontsize=10, fontweight='bold')
-    axes[i].axhline(df['defaut'].mean(), color='navy', linestyle='--',
-                    alpha=0.5, label=f'Moy. ({df["defaut"].mean():.0%})')
-    axes[i].legend(fontsize=8)
-plt.suptitle('Taux de défaut par modalité', fontweight='bold')
-plt.tight_layout()
-plt.savefig('data/processed/fig_categorical_rates.png', bbox_inches='tight')
-plt.show()
 
-corr_df = df[NUM_COLS + ['defaut']].corr()
-mask = np.triu(np.ones_like(corr_df, dtype=bool))
-fig, ax = plt.subplots(figsize=(9, 7))
-sns.heatmap(corr_df, mask=mask, annot=True, fmt='.2f', cmap='RdBu_r',
-            center=0, vmin=-1, vmax=1, ax=ax,
-            annot_kws={'size': 10}, linewidths=0.5)
-ax.set_title('Matrice de corrélation', fontweight='bold', pad=15)
-plt.tight_layout()
-plt.savefig('data/processed/fig_correlation_matrix.png', bbox_inches='tight')
-plt.show()
-print('\nCorrélations avec la cible :')
-print(corr_df['defaut'].drop('defaut').sort_values(ascending=False).to_string())
+def prepare_german():
+    german_dir = RAW_DIR / "german_credit"
+    raw_path_data = german_dir / "german.data"
+    raw_path_csv = german_dir / "german_credit.csv"
+
+    column_names = [
+        "statut_compte", "duree_mois", "historique_credit", "objet_credit",
+        "montant_credit", "epargne", "anciennete_emploi", "taux_versement",
+        "statut_civil_sexe", "autres_debiteurs", "anciennete_residence",
+        "propriete", "age", "autres_credits", "logement", "nb_credits",
+        "emploi", "nb_personnes_charge", "telephone", "travailleur_etranger",
+        "defaut"
+    ]
+
+    if raw_path_csv.exists():
+        df = pd.read_csv(raw_path_csv)
+    elif raw_path_data.exists():
+        df = pd.read_csv(raw_path_data, sep=r"\s+", header=None, names=column_names)
+    else:
+        raise FileNotFoundError(
+            f"Aucun fichier German Credit trouvé dans {german_dir}. "
+            "Attendu : german.data ou german_credit.csv"
+        )
+
+    if "defaut" not in df.columns:
+        raise ValueError("La colonne cible 'defaut' est absente du dataset German.")
+
+    # 1 = bon payeur -> 0 | 2 = mauvais payeur -> 1
+    if sorted(df["defaut"].dropna().unique().tolist()) == [1, 2]:
+        df["defaut"] = (df["defaut"] == 2).astype(int)
+
+    df_feat = df.copy()
+    df_feat["charge_mensuelle"] = df_feat["montant_credit"] / df_feat["duree_mois"]
+    df_feat["jeune_emprunteur"] = (df_feat["age"] < 30).astype(int)
+    df_feat["credit_long"] = (df_feat["duree_mois"] > 24).astype(int)
+
+    sensitive_features = {
+        "age": "age",
+        "gender": "statut_civil_sexe"
+    }
+
+    return df_feat, "defaut", sensitive_features
+
+
+def prepare_lending_club():
+    lending_dir = RAW_DIR / "lending_club"
+    raw_path = lending_dir / "lending_club.csv"
+
+    if not raw_path.exists():
+        raise FileNotFoundError(
+            f"Fichier Lending Club introuvable : {raw_path}"
+        )
+
+    print("Chargement Lending Club...")
+    df = pd.read_csv(raw_path, low_memory=False)
+
+    print(f"Dataset brut : {df.shape}")
+
+    # On garde seulement les cas clairement exploitables pour une cible binaire
+    valid_status = ["Fully Paid", "Charged Off"]
+    df = df[df["loan_status"].isin(valid_status)].copy()
+
+    # 1 = défaut / prêt problématique, 0 = non défaut
+    df["defaut"] = (df["loan_status"] == "Charged Off").astype(int)
+
+    # Colonnes à supprimer : identifiants, texte libre, fuite évidente ou inutiles pour la V1
+    drop_cols = [
+        "loan_status",
+        "id",
+        "member_id",
+        "url",
+        "desc",
+        "emp_title",
+        "title",
+        "zip_code",
+    ]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+
+    # Colonnes simples et raisonnables pour une première version propre
+    keep_cols = [
+    "loan_amnt",
+    "term",
+    "int_rate",
+    "installment",
+    "grade",
+    "sub_grade",
+    "emp_length",
+    "home_ownership",
+    "annual_inc",
+    "verification_status",
+    "purpose",
+    "dti",
+    "delinq_2yrs",
+    "fico_range_low",
+    "fico_range_high",
+    "inq_last_6mths",
+    "open_acc",
+    "pub_rec",
+    "revol_bal",
+    "revol_util",
+    "total_acc",
+    "mort_acc",
+    "pub_rec_bankruptcies",
+    "defaut",
+    ]
+    existing_keep_cols = [c for c in keep_cols if c in df.columns]
+    existing_keep_cols = list(dict.fromkeys(existing_keep_cols))  # supprime doublons éventuels
+    df = df[existing_keep_cols].copy()
+    df = df[existing_keep_cols].copy()
+
+    # Nettoyage de quelques colonnes typiquement textuelles
+    if "term" in df.columns:
+        df["term"] = df["term"].astype(str).str.replace(" months", "", regex=False).str.strip()
+
+    if "emp_length" in df.columns:
+        df["emp_length"] = (
+            df["emp_length"]
+            .astype(str)
+            .str.replace(r"\+ years", "", regex=True)
+            .str.replace(r" years", "", regex=True)
+            .str.replace(r" year", "", regex=True)
+            .str.replace(r"< 1", "0", regex=False)
+            .str.replace(r"10\+", "10", regex=True)
+            .str.strip()
+        )
+        df["emp_length"] = pd.to_numeric(df["emp_length"], errors="coerce")
+
+    if "int_rate" in df.columns:
+        df["int_rate"] = (
+            df["int_rate"].astype(str).str.replace("%", "", regex=False).str.strip()
+        )
+        df["int_rate"] = pd.to_numeric(df["int_rate"], errors="coerce")
+
+    if "revol_util" in df.columns:
+        df["revol_util"] = (
+            df["revol_util"].astype(str).str.replace("%", "", regex=False).str.strip()
+        )
+        df["revol_util"] = pd.to_numeric(df["revol_util"], errors="coerce")
+
+    if "term" in df.columns:
+        df["term"] = pd.to_numeric(df["term"], errors="coerce")
+
+    # Option pratique pour ne pas faire exploser le PC si le CSV est énorme
+    if len(df) > 50000:
+        df = df.sample(n=50000, random_state=42).copy()
+
+    print(f"Dataset nettoyé : {df.shape}")
+    print(f"Taux de défaut : {df['defaut'].mean():.2%}")
+
+    sensitive_features = {
+        "age": None,
+        "gender": None
+    }
+
+    return df, "defaut", sensitive_features
+
+def save_outputs(
+    dataset_name: str,
+    X_train_df: pd.DataFrame,
+    X_test_df: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    X_train_raw: pd.DataFrame,
+    X_test_raw: pd.DataFrame,
+    preprocessor,
+    num_features,
+    cat_features,
+    target_name: str,
+    sensitive_features: dict
+):
+    dataset_processed_dir = PROCESSED_DIR / dataset_name
+    dataset_models_dir = MODELS_DIR / dataset_name
+
+    dataset_processed_dir.mkdir(parents=True, exist_ok=True)
+    dataset_models_dir.mkdir(parents=True, exist_ok=True)
+
+    X_train_df.to_csv(dataset_processed_dir / "X_train.csv", index=False)
+    X_test_df.to_csv(dataset_processed_dir / "X_test.csv", index=False)
+    y_train.reset_index(drop=True).to_csv(dataset_processed_dir / "y_train.csv", index=False, header=[target_name])
+    y_test.reset_index(drop=True).to_csv(dataset_processed_dir / "y_test.csv", index=False, header=[target_name])
+
+    X_train_raw.reset_index(drop=True).to_csv(dataset_processed_dir / "X_train_raw.csv", index=False)
+    X_test_raw.reset_index(drop=True).to_csv(dataset_processed_dir / "X_test_raw.csv", index=False)
+
+    joblib.dump(preprocessor, dataset_models_dir / "preprocessor.pkl")
+
+    metadata = {
+        "dataset_name": dataset_name,
+        "target_name": target_name,
+        "feature_names": X_train_df.columns.tolist(),
+        "num_features": num_features,
+        "cat_features": cat_features,
+        "n_train": int(X_train_df.shape[0]),
+        "n_test": int(X_test_df.shape[0]),
+        "target_rate_train": float(y_train.mean()),
+        "target_rate_test": float(y_test.mean()),
+        "sensitive_features": sensitive_features,
+    }
+
+    with open(dataset_processed_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    print(f"\n✅ Données sauvegardées pour {dataset_name}")
+    print(f"📁 Processed : {dataset_processed_dir}")
+    print(f"📁 Models    : {dataset_models_dir}")
+
+
+def run_pipeline(dataset_name: str):
+    print(f"\n=== Préparation dataset : {dataset_name} ===")
+
+    if dataset_name == "german":
+        df, target_name, sensitive_features = prepare_german()
+    elif dataset_name == "lending_club":
+        df, target_name, sensitive_features = prepare_lending_club()
+    else:
+        raise ValueError("dataset_name doit être 'german' ou 'lending_club'")
+
+    print(f"Dataset chargé : {df.shape[0]} lignes × {df.shape[1]} colonnes")
+
+    X = df.drop(columns=[target_name])
+    y = df[target_name]
+
+    preprocessor, num_features, cat_features = build_preprocessor(X)
+
+    print(f"Numériques ({len(num_features)}) : {num_features}")
+    print(f"Catégorielles ({len(cat_features)}) : {cat_features}")
+
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        stratify=y
+    )
+
+    X_train_arr = preprocessor.fit_transform(X_train_raw)
+    X_test_arr = preprocessor.transform(X_test_raw)
+
+    feature_names_out = num_features + cat_features
+
+    X_train_df = pd.DataFrame(X_train_arr, columns=feature_names_out)
+    X_test_df = pd.DataFrame(X_test_arr, columns=feature_names_out)
+
+    save_outputs(
+        dataset_name=dataset_name,
+        X_train_df=X_train_df,
+        X_test_df=X_test_df,
+        y_train=y_train,
+        y_test=y_test,
+        X_train_raw=X_train_raw,
+        X_test_raw=X_test_raw,
+        preprocessor=preprocessor,
+        num_features=num_features,
+        cat_features=cat_features,
+        target_name=target_name,
+        sensitive_features=sensitive_features
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, required=True, choices=["german", "lending_club"])
+    args = parser.parse_args()
+
+    run_pipeline(args.dataset)
